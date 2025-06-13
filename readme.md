@@ -1,3 +1,4 @@
+### install golang with compile c and golang
 ```
 sudo yum groupinstall "Development Tools" -y
 sudo yum install clang llvm bpftool kernel-devel make -y

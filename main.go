@@ -1,131 +1,136 @@
 package main
 
 import (
-    "bytes"
-    "encoding/binary"
-    "fmt"
-    "log"
-    "os"
-    "strings"
-    "time"
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
 
-    "github.com/aws/aws-sdk-go/aws"
-    "github.com/aws/aws-sdk-go/aws/session"
-    "github.com/aws/aws-sdk-go/service/cloudwatchlogs"
-    "github.com/cilium/ebpf"
-    "github.com/cilium/ebpf/link"
-    "github.com/cilium/ebpf/perf"
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/perf"
 )
 
+// Đồng bộ với struct event_t trong C
 type event struct {
-    PID      uint32
-    Comm     [16]byte
-    Filename [256]byte
+	Pid      uint32
+	Uid      uint32
+	Comm     [16]byte
+	Filename [256]byte
+	Op       [8]byte
+	Daddr    uint32
+	Dport    uint16
+	_        [2]byte // padding cho align (do struct alignment)
 }
 
-const logGroup = "ebpf-user-monitor"
-const logStream = "execve-events"
+func formatIPv4(addr uint32) string {
+	ip := make(net.IP, 4)
+	binary.LittleEndian.PutUint32(ip, addr)
+	return ip.String()
+}
 
 func main() {
-    log.Println("Starting eBPF program...")
-    spec, err := ebpf.LoadCollectionSpec("monitor_user_change.bpf.o")
-    if err != nil {
-        log.Fatalf("Failed to load eBPF program: %v", err)
-    }
+	log.Println("🔍 Starting Sensitive Monitor (open/exec/send/conn)...")
 
-    objs := struct {
-        Program *ebpf.Program `ebpf:"trace_execve"`
-        Events  *ebpf.Map     `ebpf:"event"`
-    }{}
+	spec, err := ebpf.LoadCollectionSpec("sensitive_monitor_all.bpf.o")
+	if err != nil {
+		log.Fatalf("Failed to load BPF spec: %v", err)
+	}
 
-    if err := spec.LoadAndAssign(&objs, nil); err != nil {
-        log.Fatalf("Failed to load and assign eBPF objects: %v", err)
-    }
+	var objs struct {
+		Programs struct {
+			TraceOpenat  *ebpf.Program `ebpf:"trace_openat"`
+			TraceExecve  *ebpf.Program `ebpf:"trace_execve"`
+			TraceSendto  *ebpf.Program `ebpf:"trace_sendto"`
+			TraceConnect *ebpf.Program `ebpf:"trace_connect"`
+		}
+		Maps struct {
+			Events *ebpf.Map `ebpf:"events"`
+		}
+	}
 
-    defer objs.Program.Close()
-    defer objs.Events.Close()
+	if err := spec.LoadAndAssign(&objs, nil); err != nil {
+		log.Fatalf("Failed to load and assign: %v", err)
+	}
+	defer objs.Programs.TraceOpenat.Close()
+	defer objs.Programs.TraceExecve.Close()
+	defer objs.Programs.TraceSendto.Close()
+	defer objs.Programs.TraceConnect.Close()
+	defer objs.Maps.Events.Close()
 
-    tp, err := link.Tracepoint("syscalls", "sys_enter_execve", objs.Program, nil)
-    if err != nil {
-        log.Fatalf("Failed to attach tracepoint: %v", err)
-    }
-    defer tp.Close()
+	// Attach tracepoints
+	links := []struct {
+		tpCategory string
+		tpName     string
+		prog       *ebpf.Program
+	}{
+		{"syscalls", "sys_enter_openat", objs.Programs.TraceOpenat},
+		{"syscalls", "sys_enter_execve", objs.Programs.TraceExecve},
+		{"syscalls", "sys_enter_sendto", objs.Programs.TraceSendto},
+		{"syscalls", "sys_enter_connect", objs.Programs.TraceConnect},
+	}
 
-    log.Println("Tracepoint attached successfully")
+	for _, l := range links {
+		tp, err := link.Tracepoint(l.tpCategory, l.tpName, l.prog, nil)
+		if err != nil {
+			log.Fatalf("Failed to attach %s/%s: %v", l.tpCategory, l.tpName, err)
+		}
+		defer tp.Close()
+	}
 
-    reader, err := perf.NewReader(objs.Events, os.Getpagesize())
-    if err != nil {
-        log.Fatalf("Failed to create perf reader: %v", err)
-    }
-    defer reader.Close()
+	log.Println("✅ eBPF programs attached!")
 
-    sess := session.Must(session.NewSession(&aws.Config{
-        Region: aws.String("ap-northeast-1"),
-    }))
-    svc := cloudwatchlogs.New(sess)
+	rd, err := perf.NewReader(objs.Maps.Events, 4096)
+	if err != nil {
+		log.Fatalf("Failed to create perf reader: %v", err)
+	}
+	defer rd.Close()
 
-    ensureLogGroupAndStream(svc)
-    sequenceToken := ""
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-    for {
-        record, err := reader.Read()
-        if err != nil {
-            log.Printf("Error reading from perf buffer: %v", err)
-            continue
-        }
+	go func() {
+		for {
+			record, err := rd.Read()
+			if err != nil {
+				if err == perf.ErrClosed {
+					return
+				}
+				log.Printf("Perf event read error: %v", err)
+				continue
+			}
 
-        var e event
-        if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &e); err != nil {
-            log.Printf("Parsing event: %v", err)
-            continue
-        }
+			var e event
+			err = binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &e)
+			if err != nil {
+				log.Printf("Failed to decode event: %v", err)
+				continue
+			}
 
-        msg := fmt.Sprintf(
-            "PID=%d COMM=%s FILE=%s",
-            e.PID,
-            bytesToString(e.Comm[:]),
-            bytesToString(e.Filename[:]),
-        )
-        log.Println(msg)
+			op := string(bytes.Trim(e.Op[:], "\x00"))
+			comm := string(bytes.Trim(e.Comm[:], "\x00"))
 
-        input := &cloudwatchlogs.PutLogEventsInput{
-            LogEvents: []*cloudwatchlogs.InputLogEvent{
-                {
-                    Message:   aws.String(msg),
-                    Timestamp: aws.Int64(time.Now().Unix() * 1000),
-                },
-            },
-            LogGroupName:  aws.String(logGroup),
-            LogStreamName: aws.String(logStream),
-        }
+			switch op {
+			case "open", "exec":
+				filename := string(bytes.Trim(e.Filename[:], "\x00"))
+				fmt.Printf("🔍 PID=%d UID=%d COMM=%s OP=%s FILE=%s\n",
+					e.Pid, e.Uid, comm, op, filename)
+			case "send", "conn", "sendto":  // ← Thêm "sendto"
+				ip := formatIPv4(e.Daddr)
+				fmt.Printf("🌐 PID=%d UID=%d COMM=%s OP=%s DST=%s:%d\n",
+					e.Pid, e.Uid, comm, op, ip, e.Dport)
+			default:
+				filename := string(bytes.Trim(e.Filename[:], "\x00"))
+				fmt.Printf("❓ Unknown op: %s, PID=%d UID=%d COMM=%s FILE=%s\n",
+					op, e.Pid, e.Uid, comm, filename)
+			}
+		}
+	}()
 
-        if sequenceToken != "" {
-            input.SequenceToken = aws.String(sequenceToken)
-        }
-
-        out, err := svc.PutLogEvents(input)
-        if err != nil {
-            log.Printf("PutLogEvents error: %v", err)
-            continue
-        }
-
-        if out != nil && out.NextSequenceToken != nil {
-            sequenceToken = *out.NextSequenceToken
-        }
-    }
-}
-
-func ensureLogGroupAndStream(svc *cloudwatchlogs.CloudWatchLogs) {
-    _, _ = svc.CreateLogGroup(&cloudwatchlogs.CreateLogGroupInput{
-        LogGroupName: aws.String(logGroup),
-    })
-
-    _, _ = svc.CreateLogStream(&cloudwatchlogs.CreateLogStreamInput{
-        LogGroupName:  aws.String(logGroup),
-        LogStreamName: aws.String(logStream),
-    })
-}
-
-func bytesToString(b []byte) string {
-    return strings.TrimRight(string(b), "\x00")
+	<-sig
+	log.Println("⏹ Exiting")
 }
