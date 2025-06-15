@@ -13,7 +13,8 @@ char LICENSE[] SEC("license") = "Dual MIT/GPL";
 // This must match the Go struct exactly for proper data transfer
 struct event_t {
     u32 pid;            // Process ID
-    u32 uid;            // User ID (real or effective)
+    u32 uid;            // Real UID (actual user)
+    u32 euid;           // Effective User ID
     char comm[16];      // Process command name (truncated to 16 chars)
     char filename[256]; // File path being accessed
     char op[8];         // Operation type: "open", "exec", "conn", "send"
@@ -147,8 +148,10 @@ int trace_execve(struct trace_event_raw_sys_enter *ctx) {
     u32 loginuid = 0;
     bpf_core_read(&loginuid, sizeof(loginuid), &task->loginuid.val);
 
-    // Populate event data
-    data->uid = loginuid;  // Use login UID to track original user
+    // Trong populate event data:
+    u64 uid_gid = bpf_get_current_uid_gid();
+    data->uid = uid_gid & 0xFFFFFFFF;        // Real UID
+    data->euid = uid_gid >> 32;              // Effective UID
     data->pid = bpf_get_current_pid_tgid() >> 32;
     bpf_get_current_comm(&data->comm, sizeof(data->comm));
     bpf_probe_read_user_str(&data->filename, sizeof(data->filename), filename);

@@ -21,7 +21,8 @@ import (
 // This must be kept in sync with the BPF code
 type event struct {
 	Pid      uint32    // Process ID
-	Uid      uint32    // User ID
+	Uid      uint32    // Real UID (actual user)
+	Euid     uint32    // Effective UID (current privileges)
 	Comm     [16]byte  // Command name (process name)
 	Filename [256]byte // File path being accessed
 	Op       [8]byte   // Operation type (open, exec, conn, send)
@@ -174,28 +175,35 @@ func main() {
 				continue
 			}
 
-			// Resolve UID to username
-			username := getUsername(e.Uid)
-
 			// Process different types of security events
 			switch op {
 			case "open", "exec":
 				// File access and process execution events
 				filename := string(bytes.Trim(e.Filename[:], "\x00"))
-				fmt.Printf("🚨 SENSITIVE: PID=%d UID=%d USER=%s COMM=%s OP=%s FILE=%s\n",
-					e.Pid, e.Uid, username, comm, op, filename)
+				username := getUsername(e.Uid)
+				effective_username := getUsername(e.Euid)
+
+				if e.Uid != e.Euid {
+					// Show privilege escalation
+					fmt.Printf("🚨 SENSITIVE: PID=%d UID=%d(%s)→%d(%s) COMM=%s OP=%s FILE=%s\n",
+						e.Pid, e.Uid, username, e.Euid, effective_username, comm, op, filename)
+				} else {
+					// Normal operation
+					fmt.Printf("🚨 SENSITIVE: PID=%d UID=%d USER=%s COMM=%s OP=%s FILE=%s\n",
+						e.Pid, e.Uid, username, comm, op, filename)
+				}
 
 			case "send", "conn", "sendto":
 				// Network activity events
 				ip := formatIPv4(e.Daddr)
 				fmt.Printf("🌐 EXTERNAL: PID=%d UID=%d USER=%s COMM=%s OP=%s DST=%s:%d\n",
-					e.Pid, e.Uid, username, comm, op, ip, e.Dport)
+					e.Pid, e.Uid, getUsername(e.Uid), comm, op, ip, e.Dport)
 
 			default:
 				// Unknown operation type
 				filename := string(bytes.Trim(e.Filename[:], "\x00"))
 				fmt.Printf("❓ Unknown op: %s, PID=%d UID=%d USER=%s COMM=%s FILE=%s\n",
-					op, e.Pid, e.Uid, username, comm, filename)
+					op, e.Pid, e.Uid, getUsername(e.Uid), comm, filename)
 			}
 		}
 	}()
