@@ -1,4 +1,4 @@
-# 🛡️ Deep Kernel Monitoring with eBPF on AWS EC2: Beyond CloudWatch Agent
+# 🛡️ Deep Kernel Monitoring with eBPF on AWS EC2
 
 ## 👋 Giới thiệu
 
@@ -87,10 +87,14 @@ if (exclude_ip(ip)) return 0;
 Ví dụ output từ Go Agent:
 
 ```bash
-[ALERT] exec  | uid=1000 pid=3456 comm="sudo" filename="/usr/bin/passwd"
-[ALERT] open  | uid=1000 pid=1204 comm="vim" filename="/etc/shadow"
-[ALERT] conn  | uid=1000 pid=1299 comm="curl" daddr=93.184.216.34:443
-[ALERT] send  | uid=1000 pid=1301 comm="nc" daddr=8.8.8.8:1234
+🚨 SENSITIVE: PID=18293 UID=1007 USER=ebpfuser COMM=bash OP=exec FILE=/usr/bin/sudo
+🚨 SENSITIVE: PID=18293 UID=0 USER=root COMM=sudo OP=open FILE=/etc/sudoers
+🚨 SENSITIVE: PID=18293 UID=0 USER=root COMM=sudo OP=open FILE=/etc/sudoers.d
+🚨 SENSITIVE: PID=18293 UID=0 USER=root COMM=sudo OP=open FILE=/etc/sudoers.d
+🚨 SENSITIVE: PID=18293 UID=0 USER=root COMM=sudo OP=open FILE=/etc/sudoers.d/90-cloud-init-users
+🚨 SENSITIVE: PID=18294 UID=0 USER=root COMM=unix_chkpwd OP=open FILE=/etc/shadow
+🌐 EXTERNAL: PID=18296 UID=0 USER=root COMM=curl OP=conn DST=172.217.161.46:0
+🌐 EXTERNAL: PID=18296 UID=0 USER=root COMM=curl OP=conn DST=172.217.161.46:0
 ```
 
 → Rất dễ tích hợp với Promtail, Fluent Bit hoặc gửi thẳng lên CloudWatch Logs để làm dashboard hoặc tạo alarm.
@@ -152,6 +156,28 @@ for {
         e.Op, e.UID, e.PID, e.Comm, e.Filename)
 }
 ```
+
+## 📈 Tiếp theo
+
+- Gửi event lên CloudWatch Logs bằng AWS SDK Go.
+- Gắn tag EC2 (tên app, env, v.v.) để phân tích.
+- Export ra OpenSearch làm SIEM dashboard.
+- Dùng Lambda xử lý log để cảnh báo real-time.
+
+---
+
+## 🆚 So sánh với các phương pháp khác
+
+| Giải pháp         | Ưu điểm                                                                                                             | Hạn chế                                                                                               |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| **eBPF**          | - Realtime, chạy trong kernel- Được verifier kiểm tra an toàn- Không cần thay đổi kernel- Linh hoạt, tùy chỉnh code | - Cần hiểu sâu về kernel- Chưa phổ biến rộng rãi                                                      |
+| **Kernel Module** | - Toàn quyền, quyền lực tuyệt đối- Dễ can thiệp sâu                                                                 | - Rủi ro cao (crash kernel)- Không được verifier kiểm tra lỗi- Không tương thích giữa kernel versions |
+| **Datadog Agent** | - Dễ dùng, có dashboard- Tích hợp log/metrics sẵn                                                                   | - Cần gửi log ra ngoài- Không giám sát được hành vi kernel-level sâu                                  |
+
+**eBPF là một điểm cân bằng tuyệt vời**:
+
+- Vừa **an toàn** hơn so với Kernel Module nhờ eBPF Verifier kiểm tra lỗi.
+- Vừa **riêng tư & realtime**, không cần gửi toàn bộ log ra bên ngoài như Datadog.
 
 ---
 
@@ -236,28 +262,6 @@ bpf_trace_printk("Data: %s\n", ptr);  // unsafe
 → **Verifier sẽ từ chối chương trình này ngay khi bạn cố **``** nó vào kernel**. Không có cơ hội gây crash.
 
 ---
-
-## 📈 Tiếp theo
-
-- Gửi event lên CloudWatch Logs bằng AWS SDK Go.
-- Gắn tag EC2 (tên app, env, v.v.) để phân tích.
-- Export ra OpenSearch làm SIEM dashboard.
-- Dùng Lambda xử lý log để cảnh báo real-time.
-
----
-
-## 🆚 So sánh với các phương pháp khác
-
-| Giải pháp         | Ưu điểm                                                                                                             | Hạn chế                                                                                               |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| **eBPF**          | - Realtime, chạy trong kernel- Được verifier kiểm tra an toàn- Không cần thay đổi kernel- Linh hoạt, tùy chỉnh code | - Cần hiểu sâu về kernel- Chưa phổ biến rộng rãi                                                      |
-| **Kernel Module** | - Toàn quyền, quyền lực tuyệt đối- Dễ can thiệp sâu                                                                 | - Rủi ro cao (crash kernel)- Không được verifier kiểm tra lỗi- Không tương thích giữa kernel versions |
-| **Datadog Agent** | - Dễ dùng, có dashboard- Tích hợp log/metrics sẵn                                                                   | - Cần gửi log ra ngoài- Không giám sát được hành vi kernel-level sâu                                  |
-
-**eBPF là một điểm cân bằng tuyệt vời**:
-
-- Vừa **an toàn** hơn so với Kernel Module nhờ eBPF Verifier kiểm tra lỗi.
-- Vừa **riêng tư & realtime**, không cần gửi toàn bộ log ra bên ngoài như Datadog.
 
 ---
 
