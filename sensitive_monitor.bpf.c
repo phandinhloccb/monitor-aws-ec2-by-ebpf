@@ -33,14 +33,42 @@ struct {
     __type(value, struct event_t);
 } event_storage SEC(".maps");
 
+static __always_inline int is_aws_tokyo_ip(u32 ip) {
+    u32 ip_host = __builtin_bswap32(ip);
+
+    // Metadata Service (IMDS v1/v2)
+    if (ip_host == 0xA9FEA9FE)  // 169.254.169.254
+        return 1;
+
+    // Amazon Time Sync Service
+    if (ip_host == 0xA9FEA97B)  // 169.254.169.123
+        return 1;
+
+    // VPC nội bộ 10.0.0.0/8
+    if ((ip_host & 0xFF000000) == 0x0A000000)  // 10.x.x.x
+        return 1;
+
+
+    // AWS Tokyo IP ranges
+    if ((ip_host & 0xFF000000) == 0x0D700000) return 1; // 13.112.0.0/14
+    if ((ip_host & 0xFFFF0000) == 0x34C00000) return 1; // 52.192.0.0/15
+    if ((ip_host & 0xFFFC0000) == 0x34C40000) return 1; // 52.196.0.0/14
+    if ((ip_host & 0xFFF80000) == 0x36400000) return 1; // 54.64.0.0/13
+    if ((ip_host & 0xFFFF8000) == 0x365C0000) return 1; // 54.92.0.0/17
+    if ((ip_host & 0xFFFC0000) == 0x1F700000) return 1; // 3.112.0.0/14
+    if ((ip_host & 0xFFFF0000) == 0x1F720000) return 1; // 3.114.0.0/16
+    if ((ip_host & 0xFFFF0000) == 0x1F730000) return 1; // 3.115.0.0/16
+    if ((ip_host & 0xFFF80000) == 0x1F700000) return 1; // 3.112.0.0/13
+
+    return 0;
+}
+
+
 static __always_inline int is_sensitive_file(const char *filename) {
     const char *critical_files[] = {
         "/etc/ssh/sshd_config",
         "/etc/sudoers",
-        "/etc/passwd",
-        "/etc/shadow",
-        "/etc/hosts",
-        "/etc/resolv.conf",
+        "/etc/shadow",           // Chỉ giữ shadow, bỏ passwd vì quá nhiều noise
         "/home/ec2-user/.ssh/authorized_keys",
         "/root/.ssh/authorized_keys",
         "/var/log/auth.log",
@@ -52,7 +80,7 @@ static __always_inline int is_sensitive_file(const char *filename) {
     };
 
     #pragma unroll
-    for (int i = 0; i < 14; i++) {
+    for (int i = 0; i < 11; i++) {  // Giảm từ 14 xuống 11
         const char *target = critical_files[i];
         int len = __builtin_strlen(target);
         if (__builtin_memcmp(filename, target, len) == 0) {
@@ -107,9 +135,13 @@ int trace_execve(struct trace_event_raw_sys_enter *ctx) {
     bpf_probe_read_user_str(&data->filename, sizeof(data->filename), filename);
     __builtin_memcpy(&data->op, "exec", 5);
 
+    // Only monitor specific user management commands
     if (__builtin_memcmp(data->filename, "/usr/sbin/useradd", 18) == 0 ||
         __builtin_memcmp(data->filename, "/usr/sbin/usermod", 18) == 0 ||
-        __builtin_memcmp(data->filename, "/usr/bin/passwd", 17) == 0) {
+        __builtin_memcmp(data->filename, "/usr/bin/passwd", 17) == 0 ||
+        __builtin_memcmp(data->filename, "/usr/sbin/userdel", 18) == 0 ||
+        __builtin_memcmp(data->filename, "/usr/bin/su", 12) == 0 ||
+        __builtin_memcmp(data->filename, "/usr/bin/sudo", 14) == 0) {
         bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, data, sizeof(*data));
     }
     return 0;
@@ -141,10 +173,11 @@ int trace_connect(struct trace_event_raw_sys_enter *ctx) {
 
     data->daddr = sa.sin_addr.s_addr;
 
-    if (sa.sin_addr.s_addr == 0x7ba9fea9) { 
-        return 0; 
-    }
+    if (is_aws_tokyo_ip(sa.sin_addr.s_addr)) {
+        return 0;
+    }   
 
+    // Only report suspicious external connections
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, data, sizeof(*data));
     return 0;
 }
@@ -174,6 +207,12 @@ int trace_sendto(struct trace_event_raw_sys_enter *ctx) {
         if (sa.sin_family == AF_INET && sa.sin_addr.s_addr != 0) {
             data->daddr = sa.sin_addr.s_addr;
             data->dport = __builtin_bswap16(sa.sin_port);
+            
+            // Filter out local/expected traffic
+            if (is_aws_tokyo_ip(sa.sin_addr.s_addr)) {
+                return 0;
+            }   
+            
             bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, data, sizeof(*data));
         }
     }
