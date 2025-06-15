@@ -15,7 +15,6 @@ import (
 	"github.com/cilium/ebpf/perf"
 )
 
-// Đồng bộ với struct event_t trong C
 type event struct {
 	Pid      uint32
 	Uid      uint32
@@ -36,7 +35,7 @@ func formatIPv4(addr uint32) string {
 func main() {
 	log.Println("🔍 Starting Sensitive Monitor (open/exec/send/conn)...")
 
-	spec, err := ebpf.LoadCollectionSpec("sensitive_monitor_all.bpf.o")
+	spec, err := ebpf.LoadCollectionSpec("sensitive_monitor.bpf.o")
 	if err != nil {
 		log.Fatalf("Failed to load BPF spec: %v", err)
 	}
@@ -119,7 +118,7 @@ func main() {
 				filename := string(bytes.Trim(e.Filename[:], "\x00"))
 				fmt.Printf("🔍 PID=%d UID=%d COMM=%s OP=%s FILE=%s\n",
 					e.Pid, e.Uid, comm, op, filename)
-			case "send", "conn", "sendto":  // ← Thêm "sendto"
+			case "send", "conn", "sendto": // ← Thêm "sendto"
 				ip := formatIPv4(e.Daddr)
 				fmt.Printf("🌐 PID=%d UID=%d COMM=%s OP=%s DST=%s:%d\n",
 					e.Pid, e.Uid, comm, op, ip, e.Dport)
